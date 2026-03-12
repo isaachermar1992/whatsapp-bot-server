@@ -14,6 +14,7 @@ sock.ev.on("connection.update", async (update) => {
 const { connection, qr } = update
 
 if (qr) {
+
 console.log("ESCANEA ESTE QR")
 
 QRCode.toString(qr, { type: "terminal" }, function (err, url) {
