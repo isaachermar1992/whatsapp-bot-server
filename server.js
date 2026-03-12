@@ -1,38 +1,41 @@
-const makeWASocket = require("@whiskeysockets/baileys").default
-const { useMultiFileAuthState } = require("@whiskeysockets/baileys")
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys")
 const QRCode = require("qrcode")
 
 async function startBot() {
 
-    const { state, saveCreds } = await useMultiFileAuthState("sessions")
+const { state, saveCreds } = await useMultiFileAuthState("auth")
 
-    const sock = makeWASocket({
-        auth: state
-    })
+const sock = makeWASocket({
+auth: state
+})
 
-    sock.ev.on("connection.update", async (update) => {
+sock.ev.on("connection.update", async (update) => {
 
-        const { connection, qr } = update
+const { connection, lastDisconnect, qr } = update
 
-        if(qr){
-            console.log("QR RECIBIDO")
+if(qr){
+console.log("📱 ESCANEA ESTE QR:")
+const qrImage = await QRCode.toString(qr, { type: "terminal" })
+console.log(qrImage)
+}
 
-            const qrImage = await QRCode.toString(qr,{type:"terminal"})
-            console.log(qrImage)
-        }
+if(connection === "open"){
+console.log("✅ WhatsApp conectado")
+}
 
-        if(connection === "open"){
-            console.log("✅ WHATSAPP CONECTADO")
-        }
+if(connection === "close"){
+const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+console.log("⚠️ Conexión cerrada, reconectando...", shouldReconnect)
 
-        if(connection === "close"){
-            console.log("⚠️ Conexión cerrada, reconectando...")
-            startBot()
-        }
+if(shouldReconnect){
+startBot()
+}
+}
 
-    })
+})
 
-    sock.ev.on("creds.update", saveCreds)
+sock.ev.on("creds.update", saveCreds)
+
 }
 
 startBot()
