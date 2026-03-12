@@ -6,7 +6,8 @@ async function startBot() {
 const { state, saveCreds } = await useMultiFileAuthState("./auth")
 
 const sock = makeWASocket({
-auth: state
+auth: state,
+printQRInTerminal: false
 })
 
 sock.ev.on("connection.update", async (update) => {
@@ -15,20 +16,20 @@ const { connection, qr } = update
 
 if (qr) {
 
-console.log("ESCANEA ESTE QR")
+console.log("ESCANEA ESTE QR CON WHATSAPP")
 
-QRCode.toString(qr, { type: "terminal" }, function (err, url) {
-console.log(url)
-})
+const qrCode = await QRCode.toString(qr, { type: "terminal" })
+
+console.log(qrCode)
 
 }
 
 if (connection === "open") {
-console.log("BOT CONECTADO")
+console.log("✅ BOT CONECTADO")
 }
 
 if (connection === "close") {
-console.log("Reconectando...")
+console.log("⚠️ Conexión cerrada, reconectando...")
 setTimeout(startBot, 5000)
 }
 
