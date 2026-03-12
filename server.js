@@ -1,13 +1,16 @@
-const { default: makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys")
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys")
 const QRCode = require("qrcode")
 
 async function startBot() {
 
 const { state, saveCreds } = await useMultiFileAuthState("./auth")
 
+const { version } = await fetchLatestBaileysVersion()
+
 const sock = makeWASocket({
+version,
 auth: state,
-printQRInTerminal: false
+browser: ["Ubuntu", "Chrome", "20.0.04"]
 })
 
 sock.ev.on("connection.update", async (update) => {
@@ -16,21 +19,26 @@ const { connection, qr } = update
 
 if (qr) {
 
-console.log("ESCANEA ESTE QR CON WHATSAPP")
+console.log("ESCANEA ESTE QR")
 
-const qrCode = await QRCode.toString(qr, { type: "terminal" })
+const qrTerminal = await QRCode.toString(qr, { type: "terminal" })
 
-console.log(qrCode)
+console.log(qrTerminal)
 
 }
 
 if (connection === "open") {
-console.log("✅ BOT CONECTADO")
+
+console.log("✅ WHATSAPP CONECTADO")
+
 }
 
 if (connection === "close") {
-console.log("⚠️ Conexión cerrada, reconectando...")
+
+console.log("⚠️ Reconectando en 5 segundos")
+
 setTimeout(startBot, 5000)
+
 }
 
 })
