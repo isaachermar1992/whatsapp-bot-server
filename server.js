@@ -3,7 +3,7 @@ const QRCode = require("qrcode")
 
 async function startBot() {
 
-const { state, saveCreds } = await useMultiFileAuthState("auth")
+const { state, saveCreds } = await useMultiFileAuthState("./auth")
 
 const sock = makeWASocket({
 auth: state
@@ -14,7 +14,6 @@ sock.ev.on("connection.update", async (update) => {
 const { connection, qr } = update
 
 if (qr) {
-
 console.log("ESCANEA ESTE QR")
 
 QRCode.toString(qr, { type: "terminal" }, function (err, url) {
@@ -29,7 +28,7 @@ console.log("BOT CONECTADO")
 
 if (connection === "close") {
 console.log("Reconectando...")
-startBot()
+setTimeout(startBot, 5000)
 }
 
 })
