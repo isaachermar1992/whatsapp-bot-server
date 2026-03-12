@@ -11,6 +11,8 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9"
+  "@whiskeysockets/baileys": "^7.0.0-rc.9",
+  "qrcode": "^1.5.4"
+}
   }
 }
