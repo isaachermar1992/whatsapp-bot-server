@@ -1,20 +1,16 @@
 {
   "name": "whatsapp-bot-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "WhatsApp bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-  "@whiskeysockets/baileys": "^7.0.0-rc.9",
-  "qrcode": "^1.5.4"
-}
-  "@whiskeysockets/baileys": "^7.0.0-rc.9",
-  "qrcode": "^1.5.4"
-}
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "qrcode": "^1.5.4"
   }
+}
