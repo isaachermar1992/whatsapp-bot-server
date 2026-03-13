@@ -1,13 +1,9 @@
 {
-"name": "whatsapp-bot-server",
-"version": "1.0.0",
-"scripts": {
-  "start": "node server.js"
-},
 "dependencies": {
-  "@whiskeysockets/baileys": "^6.7.16",
-  "express": "^4.21.0",
+  "@whiskeysockets/baileys": "latest",
+  "express": "^4.18.0",
   "cors": "^2.8.5",
-  "qrcode": "^1.5.4"
+  "qrcode": "^1.5.3",
+  "pino": "^8.0.0"
 }
 }
