@@ -4,6 +4,7 @@ const cors = require("cors");
 const QRCode = require("qrcode");
 const fs = require("fs");
 const pino = require("pino");
+const OpenAI = require("openai");
 
 const app = express();
 app.use(cors());
@@ -14,20 +15,37 @@ let currentQR = null;
 let isConnected = false;
 let phoneInfo = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT = 8;
+let isStarting = false;
+const MAX_RECONNECT = 5;
 const AUTH_DIR = "./auth_info";
 
 const logger = pino({ level: "silent" });
 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || "",
+});
+
+const botConfig = {
+  enabled: true,
+  model: "gpt-4o",
+  temperature: 0.7,
+  systemPrompt: process.env.BOT_SYSTEM_PROMPT || "Eres un asistente virtual amable y profesional de una empresa mexicana. Responde de manera clara, concisa y en español. Si no sabes algo, dilo honestamente. Usa emojis moderadamente.",
+  welcomeMessage: process.env.BOT_WELCOME_MESSAGE || "¡Hola! 👋 Soy un asistente virtual. ¿En qué puedo ayudarte?",
+};
+
+const conversationHistory = new Map();
+const MAX_HISTORY = 20;
+const processedMessages = new Set();
+
 function clearAuthState() {
-  console.log("LIMPIANDO SESION...");
+  console.log("[SERVER] Limpiando sesion...");
   try {
     if (fs.existsSync(AUTH_DIR)) {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     }
-    console.log("SESION LIMPIADA");
+    console.log("[SERVER] Sesion limpiada");
   } catch (e) {
-    console.error("Error limpiando sesion:", e.message);
+    console.error("[SERVER] Error limpiando sesion:", e.message);
   }
 }
 
@@ -35,10 +53,63 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function getAIResponse(sender, message) {
+  if (!openai.apiKey) {
+    console.log("[BOT] No OpenAI API key configured");
+    return null;
+  }
+
+  try {
+    let history = conversationHistory.get(sender) || [];
+
+    history.push({ role: "user", content: message });
+
+    if (history.length > MAX_HISTORY) {
+      history = history.slice(-MAX_HISTORY);
+    }
+
+    conversationHistory.set(sender, history);
+
+    const messages = [
+      { role: "system", content: botConfig.systemPrompt },
+      ...history,
+    ];
+
+    console.log("[BOT] Generando respuesta para", sender.split("@")[0]);
+
+    const completion = await openai.chat.completions.create({
+      model: botConfig.model,
+      messages,
+      temperature: botConfig.temperature,
+      max_tokens: 500,
+    });
+
+    const reply = completion.choices[0]?.message?.content;
+
+    if (reply) {
+      history.push({ role: "assistant", content: reply });
+      conversationHistory.set(sender, history);
+      console.log("[BOT] Respuesta generada:", reply.substring(0, 80) + "...");
+    }
+
+    return reply;
+  } catch (error) {
+    console.error("[BOT] Error OpenAI:", error.message);
+    return null;
+  }
+}
+
 async function startWhatsApp() {
+  if (isStarting) {
+    console.log("[SERVER] Ya se esta iniciando, ignorando...");
+    return;
+  }
+
+  isStarting = true;
+
   try {
     const { version } = await fetchLatestBaileysVersion();
-    console.log("Usando WA version:", version.join("."));
+    console.log("[SERVER] WA version:", version.join("."));
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
@@ -46,9 +117,12 @@ async function startWhatsApp() {
       auth: state,
       version,
       logger,
-      browser: ["WhatsApp Bot", "Chrome", "1.0.0"],
+      browser: ["WA Bot Server", "Chrome", "22.0"],
       connectTimeoutMs: 60000,
-      qrTimeout: 60000,
+      qrTimeout: 40000,
+      defaultQueryTimeoutMs: 60000,
+      retryRequestDelayMs: 500,
+      markOnlineOnConnect: false,
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -57,33 +131,34 @@ async function startWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log("QR RECIBIDO");
+        console.log("[SERVER] QR recibido - generando imagen...");
         try {
-          currentQR = await QRCode.toDataURL(qr);
-          console.log("QR GENERADO como data URL");
+          currentQR = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
+          console.log("[SERVER] QR generado OK");
         } catch (e) {
-          console.error("Error generando QR:", e.message);
+          console.error("[SERVER] Error generando QR:", e.message);
         }
-        reconnectAttempts = 0;
       }
 
       if (connection === "open") {
-        console.log("CONECTADO a WhatsApp!");
+        console.log("[SERVER] ✅ CONECTADO a WhatsApp!");
         isConnected = true;
+        isStarting = false;
         currentQR = null;
         phoneInfo = sock.user;
         reconnectAttempts = 0;
-        console.log("Usuario:", phoneInfo?.id, phoneInfo?.name);
+        console.log("[SERVER] Usuario:", phoneInfo?.id, phoneInfo?.name);
       }
 
       if (connection === "close") {
         isConnected = false;
+        isStarting = false;
         const code = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.output?.payload?.message || "unknown";
-        console.log("CONEXION CERRADA - codigo:", code, "razon:", reason);
+        console.log("[SERVER] Conexion cerrada - codigo:", code, "razon:", reason);
 
         if (code === DisconnectReason.loggedOut || code === 401) {
-          console.log("SESION CERRADA/INVALIDA - limpiando...");
+          console.log("[SERVER] Sesion cerrada por el usuario");
           clearAuthState();
           phoneInfo = null;
           currentQR = null;
@@ -91,38 +166,33 @@ async function startWhatsApp() {
           await sleep(5000);
           startWhatsApp();
         } else if (code === 405) {
-          console.log("ERROR 405 - sesion corrupta, limpiando...");
+          console.log("[SERVER] Error 405 - sesion corrupta");
           clearAuthState();
           phoneInfo = null;
           currentQR = null;
           reconnectAttempts++;
 
-          if (reconnectAttempts > 3) {
-            const delay = Math.min(30000, 10000 * reconnectAttempts);
-            console.log("Demasiados 405 - esperando", delay / 1000, "s...");
-            await sleep(delay);
-          } else {
-            await sleep(5000);
-          }
+          const delay = Math.min(15000 + (reconnectAttempts * 10000), 120000);
+          console.log("[SERVER] Esperando", delay / 1000, "s antes de reiniciar (intento", reconnectAttempts, ")");
+          await sleep(delay);
 
           if (reconnectAttempts <= MAX_RECONNECT) {
             startWhatsApp();
           } else {
-            console.log("MAXIMO REINTENTOS - esperando 2 minutos...");
+            console.log("[SERVER] Maximo reintentos 405 alcanzado. Esperando 5 minutos...");
             reconnectAttempts = 0;
-            await sleep(120000);
+            await sleep(300000);
             startWhatsApp();
           }
         } else if (code === 515 || code === 408 || code === 503) {
-          console.log("Error temporal, reconectando...");
+          console.log("[SERVER] Error temporal, reconectando...");
           reconnectAttempts++;
-          const delay = Math.min(5000 * reconnectAttempts, 30000);
-          console.log("Esperando", delay / 1000, "s...");
+          const delay = Math.min(5000 * reconnectAttempts, 60000);
           await sleep(delay);
           if (reconnectAttempts <= MAX_RECONNECT) {
             startWhatsApp();
           } else {
-            console.log("MAXIMO REINTENTOS - limpiando y esperando...");
+            console.log("[SERVER] Maximo reintentos alcanzado. Limpiando...");
             clearAuthState();
             reconnectAttempts = 0;
             await sleep(60000);
@@ -131,60 +201,111 @@ async function startWhatsApp() {
         } else {
           reconnectAttempts++;
           if (reconnectAttempts <= MAX_RECONNECT) {
-            const delay = Math.min(3000 * reconnectAttempts, 30000);
-            console.log("Reconectando en", delay / 1000, "s... (intento", reconnectAttempts, ")");
+            const delay = Math.min(5000 * reconnectAttempts, 60000);
+            console.log("[SERVER] Reconectando en", delay / 1000, "s (intento", reconnectAttempts, ")");
             await sleep(delay);
             startWhatsApp();
           } else {
-            console.log("MAXIMO REINTENTOS - esperando 2 minutos...");
+            console.log("[SERVER] Maximo reintentos. Esperando 3 minutos...");
             clearAuthState();
             reconnectAttempts = 0;
-            await sleep(120000);
+            await sleep(180000);
             startWhatsApp();
           }
         }
       }
     });
 
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
+        if (!msg.message) continue;
+
+        const msgId = msg.key.id;
+        if (processedMessages.has(msgId)) continue;
+        processedMessages.add(msgId);
+
+        if (processedMessages.size > 1000) {
+          const entries = Array.from(processedMessages);
+          entries.slice(0, 500).forEach((id) => processedMessages.delete(id));
+        }
+
         const sender = msg.key.remoteJid;
-        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "";
-        if (text) {
-          console.log("MENSAJE de", sender, ":", text.substring(0, 100));
+        if (!sender || sender.endsWith("@g.us") || sender === "status@broadcast") continue;
+
+        const text =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          "";
+
+        if (!text.trim()) continue;
+
+        console.log("[MSG] De:", sender.split("@")[0], "Texto:", text.substring(0, 100));
+
+        if (botConfig.enabled && openai.apiKey) {
+          try {
+            await sock.readMessages([msg.key]);
+          } catch (_) {}
+
+          try {
+            await sock.sendPresenceUpdate("composing", sender);
+          } catch (_) {}
+
+          const reply = await getAIResponse(sender, text);
+
+          try {
+            await sock.sendPresenceUpdate("paused", sender);
+          } catch (_) {}
+
+          if (reply && sock && isConnected) {
+            try {
+              await sock.sendMessage(sender, { text: reply });
+              console.log("[MSG] Respuesta enviada a", sender.split("@")[0]);
+            } catch (e) {
+              console.error("[MSG] Error enviando respuesta:", e.message);
+            }
+          }
         }
       }
     });
   } catch (error) {
-    console.error("ERROR FATAL iniciando WhatsApp:", error.message);
+    console.error("[SERVER] ERROR FATAL:", error.message);
+    isStarting = false;
     reconnectAttempts++;
-    const delay = Math.min(10000 * reconnectAttempts, 60000);
-    console.log("Reintentando en", delay / 1000, "s...");
+    const delay = Math.min(15000 * reconnectAttempts, 120000);
+    console.log("[SERVER] Reintentando en", delay / 1000, "s...");
     await sleep(delay);
     if (reconnectAttempts <= MAX_RECONNECT) {
       startWhatsApp();
     } else {
-      console.log("Demasiados errores fatales - esperando 3 minutos...");
+      console.log("[SERVER] Demasiados errores fatales. Esperando 5 minutos...");
       reconnectAttempts = 0;
-      await sleep(180000);
+      await sleep(300000);
       startWhatsApp();
     }
   }
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", connected: isConnected, uptime: process.uptime() });
+  res.json({
+    status: "ok",
+    connected: isConnected,
+    uptime: Math.floor(process.uptime()),
+    botEnabled: botConfig.enabled,
+    hasOpenAI: !!openai.apiKey,
+  });
 });
 
 app.get("/qr", (req, res) => {
   if (isConnected) {
-    return res.json({ connected: true });
+    return res.json({ connected: true, qr: null });
   }
   if (currentQR) {
     return res.json({ qr: currentQR, connected: false });
   }
-  return res.json({ error: "QR no disponible, espera unos segundos...", connected: false });
+  return res.json({ qr: null, connected: false, message: "Esperando QR... intenta en unos segundos" });
 });
 
 app.get("/status", (req, res) => {
@@ -193,6 +314,8 @@ app.get("/status", (req, res) => {
     phoneNumber: phoneInfo?.id?.split(":")[0] || null,
     name: phoneInfo?.name || null,
     reconnectAttempts,
+    botEnabled: botConfig.enabled,
+    hasOpenAI: !!openai.apiKey,
   });
 });
 
@@ -207,12 +330,27 @@ app.post("/send", async (req, res) => {
   try {
     const jid = number.includes("@s.whatsapp.net") ? number : `${number}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: message });
-    console.log("MENSAJE ENVIADO a", jid);
+    console.log("[API] Mensaje enviado a", jid);
     res.json({ ok: true });
   } catch (e) {
-    console.error("Error enviando:", e.message);
+    console.error("[API] Error enviando:", e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+app.post("/bot/config", (req, res) => {
+  const { enabled, systemPrompt, welcomeMessage, model, temperature } = req.body;
+  if (typeof enabled === "boolean") botConfig.enabled = enabled;
+  if (systemPrompt) botConfig.systemPrompt = systemPrompt;
+  if (welcomeMessage) botConfig.welcomeMessage = welcomeMessage;
+  if (model) botConfig.model = model;
+  if (typeof temperature === "number") botConfig.temperature = temperature;
+  console.log("[API] Bot config actualizada:", JSON.stringify(botConfig).substring(0, 200));
+  res.json({ ok: true, config: botConfig });
+});
+
+app.get("/bot/config", (req, res) => {
+  res.json(botConfig);
 });
 
 app.post("/disconnect", async (req, res) => {
@@ -220,18 +358,14 @@ app.post("/disconnect", async (req, res) => {
     if (sock) {
       await sock.logout();
     }
-    clearAuthState();
-    isConnected = false;
-    phoneInfo = null;
-    currentQR = null;
-    res.json({ ok: true });
-    setTimeout(startWhatsApp, 3000);
-  } catch (e) {
-    clearAuthState();
-    isConnected = false;
-    res.json({ ok: false, error: e.message });
-    setTimeout(startWhatsApp, 3000);
-  }
+  } catch (_) {}
+  clearAuthState();
+  isConnected = false;
+  phoneInfo = null;
+  currentQR = null;
+  conversationHistory.clear();
+  res.json({ ok: true });
+  setTimeout(startWhatsApp, 3000);
 });
 
 app.post("/restart", async (req, res) => {
@@ -242,16 +376,20 @@ app.post("/restart", async (req, res) => {
   } catch (_) {}
   clearAuthState();
   isConnected = false;
+  isStarting = false;
   phoneInfo = null;
   currentQR = null;
   reconnectAttempts = 0;
+  conversationHistory.clear();
   res.json({ ok: true, message: "Reiniciando..." });
-  await sleep(2000);
+  await sleep(3000);
   startWhatsApp();
 });
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log("[SERVER] Corriendo en puerto", PORT);
+  console.log("[SERVER] OpenAI API key:", openai.apiKey ? "configurada ✅" : "NO configurada ❌");
+  console.log("[SERVER] Bot:", botConfig.enabled ? "activo ✅" : "desactivado ❌");
   startWhatsApp();
 });
