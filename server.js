@@ -56,7 +56,7 @@ function sleep(ms) {
 async function getAIResponse(sender, message) {
   if (!openai.apiKey) {
     console.log("[BOT] No OpenAI API key configured");
-    return null;
+    return "Lo siento, el bot no está configurado correctamente. Contacta al administrador.";
   }
 
   try {
@@ -76,6 +76,9 @@ async function getAIResponse(sender, message) {
     ];
 
     console.log("[BOT] Generando respuesta para", sender.split("@")[0]);
+    console.log("[BOT] Modelo:", botConfig.model);
+    console.log("[BOT] API Key (primeros 8 chars):", openai.apiKey ? openai.apiKey.substring(0, 8) + "..." : "NONE");
+    console.log("[BOT] Mensajes en historial:", messages.length);
 
     const completion = await openai.chat.completions.create({
       model: botConfig.model,
@@ -84,18 +87,29 @@ async function getAIResponse(sender, message) {
       max_tokens: 500,
     });
 
+    console.log("[BOT] OpenAI response received, choices:", completion.choices?.length);
+
     const reply = completion.choices[0]?.message?.content;
 
     if (reply) {
       history.push({ role: "assistant", content: reply });
       conversationHistory.set(sender, history);
       console.log("[BOT] Respuesta generada:", reply.substring(0, 80) + "...");
+    } else {
+      console.error("[BOT] OpenAI devolvio respuesta vacia. Full response:", JSON.stringify(completion).substring(0, 500));
+      return "Disculpa, no pude procesar tu mensaje. Intenta de nuevo.";
     }
 
     return reply;
   } catch (error) {
-    console.error("[BOT] Error OpenAI:", error.message);
-    return null;
+    console.error("[BOT] Error OpenAI completo:", error.message);
+    console.error("[BOT] Error tipo:", error.constructor?.name);
+    console.error("[BOT] Error status:", error.status || "N/A");
+    console.error("[BOT] Error code:", error.code || "N/A");
+    if (error.response) {
+      console.error("[BOT] Error response data:", JSON.stringify(error.response.data || {}).substring(0, 500));
+    }
+    return "Lo siento, ocurrió un error al procesar tu mensaje. Intenta de nuevo en un momento.";
   }
 }
 
@@ -217,14 +231,23 @@ async function startWhatsApp() {
     });
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
+      console.log("[MSG] messages.upsert tipo:", type, "cantidad:", messages.length);
 
       for (const msg of messages) {
+        console.log("[MSG] Raw key:", JSON.stringify(msg.key));
+        console.log("[MSG] fromMe:", msg.key.fromMe, "hasMessage:", !!msg.message);
+        if (msg.message) {
+          console.log("[MSG] Tipos de mensaje:", Object.keys(msg.message).join(", "));
+        }
+
         if (msg.key.fromMe) continue;
         if (!msg.message) continue;
 
         const msgId = msg.key.id;
-        if (processedMessages.has(msgId)) continue;
+        if (processedMessages.has(msgId)) {
+          console.log("[MSG] Mensaje ya procesado:", msgId);
+          continue;
+        }
         processedMessages.add(msgId);
 
         if (processedMessages.size > 1000) {
@@ -233,14 +256,26 @@ async function startWhatsApp() {
         }
 
         const sender = msg.key.remoteJid;
-        if (!sender || sender.endsWith("@g.us") || sender === "status@broadcast") continue;
+        if (!sender || sender.endsWith("@g.us") || sender === "status@broadcast") {
+          console.log("[MSG] Ignorado - sender:", sender);
+          continue;
+        }
 
         const text =
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
+          msg.message?.templateMessage?.hydratedTemplate?.hydratedContentText ||
+          msg.message?.buttonsResponseMessage?.selectedDisplayText ||
+          msg.message?.listResponseMessage?.title ||
+          msg.message?.imageMessage?.caption ||
+          msg.message?.videoMessage?.caption ||
+          msg.message?.documentMessage?.caption ||
           "";
 
-        if (!text.trim()) continue;
+        if (!text.trim()) {
+          console.log("[MSG] Sin texto extraible del mensaje");
+          continue;
+        }
 
         console.log("[MSG] De:", sender.split("@")[0], "Texto:", text.substring(0, 100));
 
@@ -261,11 +296,15 @@ async function startWhatsApp() {
 
           if (reply && sock && isConnected) {
             try {
+              console.log("[MSG] Intentando enviar respuesta a", sender.split("@")[0], "- longitud:", reply.length);
               await sock.sendMessage(sender, { text: reply });
-              console.log("[MSG] Respuesta enviada a", sender.split("@")[0]);
+              console.log("[MSG] ✅ Respuesta enviada exitosamente a", sender.split("@")[0]);
             } catch (e) {
-              console.error("[MSG] Error enviando respuesta:", e.message);
+              console.error("[MSG] ❌ Error enviando respuesta:", e.message);
+              console.error("[MSG] Error stack:", e.stack?.substring(0, 300));
             }
+          } else {
+            console.error("[MSG] No se pudo enviar - reply:", !!reply, "sock:", !!sock, "connected:", isConnected);
           }
         }
       }
@@ -366,6 +405,90 @@ app.post("/disconnect", async (req, res) => {
   conversationHistory.clear();
   res.json({ ok: true });
   setTimeout(startWhatsApp, 3000);
+});
+
+app.get("/test-ai", async (req, res) => {
+  try {
+    console.log("[TEST] Probando OpenAI...");
+    console.log("[TEST] API Key presente:", !!openai.apiKey);
+    console.log("[TEST] API Key (primeros 8):", openai.apiKey ? openai.apiKey.substring(0, 8) + "..." : "NONE");
+    console.log("[TEST] Modelo:", botConfig.model);
+
+    if (!openai.apiKey) {
+      return res.json({ ok: false, error: "No API key configured", apiKey: false });
+    }
+
+    const start = Date.now();
+    const completion = await openai.chat.completions.create({
+      model: botConfig.model,
+      messages: [
+        { role: "system", content: "Responde solo: OK" },
+        { role: "user", content: "Test" },
+      ],
+      max_tokens: 10,
+    });
+    const elapsed = Date.now() - start;
+
+    const reply = completion.choices[0]?.message?.content;
+    console.log("[TEST] Respuesta:", reply, "en", elapsed, "ms");
+
+    res.json({
+      ok: true,
+      reply,
+      model: botConfig.model,
+      elapsed: elapsed + "ms",
+      apiKeyPrefix: openai.apiKey.substring(0, 8) + "...",
+    });
+  } catch (error) {
+    console.error("[TEST] Error:", error.message);
+    res.json({
+      ok: false,
+      error: error.message,
+      status: error.status || null,
+      code: error.code || null,
+      type: error.constructor?.name,
+    });
+  }
+});
+
+app.get("/conversations", (req, res) => {
+  const conversations = [];
+  for (const [sender, history] of conversationHistory.entries()) {
+    const phone = sender.split("@")[0];
+    const lastMsg = history[history.length - 1];
+    conversations.push({
+      id: sender,
+      contactPhone: phone,
+      contactName: phone,
+      lastMessage: lastMsg?.content || "",
+      lastMessageAt: new Date().toISOString(),
+      messageCount: history.length,
+      messages: history.map((m, i) => ({
+        id: `${sender}_${i}`,
+        content: m.content,
+        sender: m.role === "user" ? "user" : "bot",
+        timestamp: new Date().toISOString(),
+        type: "text",
+        isRead: true,
+      })),
+    });
+  }
+  conversations.sort((a, b) => b.messageCount - a.messageCount);
+  res.json({ conversations, total: conversations.length });
+});
+
+app.get("/logs", (req, res) => {
+  res.json({
+    connected: isConnected,
+    botEnabled: botConfig.enabled,
+    hasOpenAI: !!openai.apiKey,
+    apiKeyPrefix: openai.apiKey ? openai.apiKey.substring(0, 8) + "..." : "NONE",
+    model: botConfig.model,
+    systemPromptLength: botConfig.systemPrompt?.length || 0,
+    activeConversations: conversationHistory.size,
+    processedMessages: processedMessages.size,
+    phoneInfo: phoneInfo ? { id: phoneInfo.id, name: phoneInfo.name } : null,
+  });
 });
 
 app.post("/restart", async (req, res) => {
