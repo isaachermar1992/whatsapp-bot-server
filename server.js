@@ -1,86 +1,102 @@
-const express = require("express")
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys")
-const QRCode = require("qrcode")
+// server.js
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const express = require("express");
+const cors = require("cors");
+const QRCode = require("qrcode");
 
-const app = express()
-app.use(express.json())
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-const PORT = process.env.PORT || 3000
+let sock = null;
+let currentQR = null;
+let isConnected = false;
+let phoneInfo = null;
 
-let qrCode = null
-let sock = null
+async function startWhatsApp() {
+const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
 
-async function startBot() {
+sock = makeWASocket({
+  auth: state,
+  printQRInTerminal: false,
+});
 
-  const { state, saveCreds } = await useMultiFileAuthState("./session")
+sock.ev.on("creds.update", saveCreds);
 
-  const { version } = await fetchLatestBaileysVersion()
+sock.ev.on("connection.update", async (update) => {
+  const { connection, lastDisconnect, qr } = update;
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: true
-  })
+  if (qr) {
+    console.log("QR RECIBIDO");
+    currentQR = await QRCode.toDataURL(qr);
+    console.log("QR GENERADO como base64");
+  }
 
-  sock.ev.on("connection.update", async (update) => {
+  if (connection === "open") {
+    console.log("CONECTADO a WhatsApp");
+    isConnected = true;
+    currentQR = null;
+    phoneInfo = sock.user;
+  }
 
-    const { connection, qr } = update
+  if (connection === "close") {
+    isConnected = false;
+    phoneInfo = null;
+    const code = lastDisconnect?.error?.output?.statusCode;
+    console.log("CONEXION CERRADA - codigo:", code);
 
-    if (qr) {
-      console.log("QR RECIBIDO")
-      qrCode = await QRCode.toDataURL(qr)
-      console.log("QR GENERADO")
+    if (code !== DisconnectReason.loggedOut) {
+      console.log("REINICIANDO...");
+      setTimeout(startWhatsApp, 3000);
+    } else {
+      console.log("SESION CERRADA - escanea QR de nuevo");
+      currentQR = null;
+      setTimeout(startWhatsApp, 3000);
     }
-
-    if (connection === "open") {
-      console.log("WHATSAPP CONECTADO")
-    }
-
-    if (connection === "close") {
-      console.log("CONEXION CERRADA - REINICIANDO")
-      setTimeout(startBot, 5000)
-    }
-
-  })
-
-  sock.ev.on("creds.update", saveCreds)
-
+  }
+});
 }
 
-startBot()
-
-/* endpoint para que la app obtenga el QR */
-
-app.get("/whatsapp/connect", (req, res) => {
-
-  if (!qrCode) {
-    return res.json({
-      status: "generating"
-    })
-  }
-
-  res.json({
-    status: "pending",
-    qr: qrCode
-  })
-
-})
-
-/* endpoint para ver el QR en navegador */
+// Endpoints que la app necesita
+app.get("/", (req, res) => {
+res.json({ status: "ok", connected: isConnected });
+});
 
 app.get("/qr", (req, res) => {
+if (isConnected) {
+  return res.json({ connected: true });
+}
+if (currentQR) {
+  return res.json({ qr: currentQR, connected: false });
+}
+return res.json({ error: "QR no disponible aún, espera unos segundos", connected: false });
+});
 
-  if (!qrCode) {
-    return res.send("QR aun no generado")
-  }
+app.get("/status", (req, res) => {
+res.json({
+  connected: isConnected,
+  phoneNumber: phoneInfo?.id?.split(":")[0] || null,
+  name: phoneInfo?.name || null,
+});
+});
 
-  res.send(`
-    <h2>Escanea el QR</h2>
-    <img src="${qrCode}" width="300"/>
-  `)
+app.post("/disconnect", async (req, res) => {
+try {
+  if (sock) await sock.logout();
+  res.json({ ok: true });
+} catch (e) {
+  res.json({ ok: false, error: e.message });
+}
+});
 
-})
+app.post("/restart", (req, res) => {
+if (sock) sock.end();
+startWhatsApp();
+res.json({ ok: true });
+});
 
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log("Server running on port", PORT)
-})
+console.log("Server running on port", PORT);
+startWhatsApp();
+});
