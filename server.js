@@ -3,6 +3,8 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -12,9 +14,24 @@ let sock = null;
 let currentQR = null;
 let isConnected = false;
 let phoneInfo = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT = 10;
+const AUTH_DIR = "./auth_info";
+
+function clearAuthState() {
+console.log("LIMPIANDO SESION CORRUPTA...");
+try {
+  if (fs.existsSync(AUTH_DIR)) {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    console.log("SESION LIMPIADA");
+  }
+} catch (e) {
+  console.error("Error limpiando sesion:", e.message);
+}
+}
 
 async function startWhatsApp() {
-const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
 sock = makeWASocket({
   auth: state,
@@ -29,7 +46,8 @@ sock.ev.on("connection.update", async (update) => {
   if (qr) {
     console.log("QR RECIBIDO");
     currentQR = await QRCode.toDataURL(qr);
-    console.log("QR GENERADO como base64");
+    console.log("QR GENERADO");
+    reconnectAttempts = 0;
   }
 
   if (connection === "open") {
@@ -37,6 +55,7 @@ sock.ev.on("connection.update", async (update) => {
     isConnected = true;
     currentQR = null;
     phoneInfo = sock.user;
+    reconnectAttempts = 0;
   }
 
   if (connection === "close") {
@@ -45,19 +64,30 @@ sock.ev.on("connection.update", async (update) => {
     const code = lastDisconnect?.error?.output?.statusCode;
     console.log("CONEXION CERRADA - codigo:", code);
 
-    if (code !== DisconnectReason.loggedOut) {
-      console.log("REINICIANDO...");
-      setTimeout(startWhatsApp, 3000);
+    if (code === 405 || code === 401 || code === 403) {
+      console.log("SESION INVALIDA - limpiando y reiniciando...");
+      clearAuthState();
+      reconnectAttempts = 0;
+      setTimeout(startWhatsApp, 5000);
+    } else if (code !== DisconnectReason.loggedOut) {
+      reconnectAttempts++;
+      if (reconnectAttempts > MAX_RECONNECT) {
+        console.log("MAXIMO DE REINTENTOS - limpiando sesion...");
+        clearAuthState();
+        reconnectAttempts = 0;
+      }
+      const delay = Math.min(3000 * reconnectAttempts, 30000);
+      console.log("REINICIANDO en", delay / 1000, "segundos...");
+      setTimeout(startWhatsApp, delay);
     } else {
-      console.log("SESION CERRADA - escanea QR de nuevo");
-      currentQR = null;
-      setTimeout(startWhatsApp, 3000);
+      console.log("SESION CERRADA por usuario");
+      clearAuthState();
+      setTimeout(startWhatsApp, 5000);
     }
   }
 });
 }
 
-// Endpoints que la app necesita
 app.get("/", (req, res) => {
 res.json({ status: "ok", connected: isConnected });
 });
@@ -69,7 +99,7 @@ if (isConnected) {
 if (currentQR) {
   return res.json({ qr: currentQR, connected: false });
 }
-return res.json({ error: "QR no disponible aún, espera unos segundos", connected: false });
+return res.json({ error: "QR no disponible aun, espera unos segundos", connected: false });
 });
 
 app.get("/status", (req, res) => {
@@ -83,6 +113,7 @@ res.json({
 app.post("/disconnect", async (req, res) => {
 try {
   if (sock) await sock.logout();
+  clearAuthState();
   res.json({ ok: true });
 } catch (e) {
   res.json({ ok: false, error: e.message });
@@ -91,6 +122,7 @@ try {
 
 app.post("/restart", (req, res) => {
 if (sock) sock.end();
+clearAuthState();
 startWhatsApp();
 res.json({ ok: true });
 });
