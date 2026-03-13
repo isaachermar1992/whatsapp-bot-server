@@ -7,116 +7,80 @@ app.use(express.json())
 
 const PORT = process.env.PORT || 3000
 
-let sock = null
 let qrCode = null
-let connected = false
-let openaiKey = null
+let sock = null
 
 async function startBot() {
 
-const { state, saveCreds } = await useMultiFileAuthState("./auth")
-const { version } = await fetchLatestBaileysVersion()
+  const { state, saveCreds } = await useMultiFileAuthState("./session")
 
-sock = makeWASocket({
-version,
-auth: state,
-browser: ["Ubuntu", "Chrome", "20.0.04"]
-})
+  const { version } = await fetchLatestBaileysVersion()
 
-sock.ev.on("connection.update", async (update) => {
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true
+  })
 
-const { connection, qr } = update
+  sock.ev.on("connection.update", async (update) => {
 
-if (qr) {
-qrCode = await QRCode.toDataURL(qr)
-}
+    const { connection, qr } = update
 
-if (connection === "open") {
-connected = true
-console.log("WHATSAPP CONECTADO")
-}
+    if (qr) {
+      console.log("QR RECIBIDO")
+      qrCode = await QRCode.toDataURL(qr)
+      console.log("QR GENERADO")
+    }
 
-if (connection === "close") {
-connected = false
-console.log("Reconectando...")
-setTimeout(startBot, 5000)
-}
+    if (connection === "open") {
+      console.log("WHATSAPP CONECTADO")
+    }
 
-})
+    if (connection === "close") {
+      console.log("CONEXION CERRADA - REINICIANDO")
+      setTimeout(startBot, 5000)
+    }
 
-sock.ev.on("creds.update", saveCreds)
+  })
+
+  sock.ev.on("creds.update", saveCreds)
 
 }
 
 startBot()
 
-/* ---------------- API PARA LA APP ---------------- */
-
-/* obtener QR */
+/* endpoint para que la app obtenga el QR */
 
 app.get("/whatsapp/connect", (req, res) => {
 
-if (!qrCode) {
-return res.json({
-status: "generating"
-})
-}
+  if (!qrCode) {
+    return res.json({
+      status: "generating"
+    })
+  }
 
-res.json({
-status: "pending",
-qr: qrCode
-})
-
-})
-
-/* estado del whatsapp */
-
-app.get("/whatsapp/status", (req, res) => {
-
-res.json({
-connected: connected
-})
+  res.json({
+    status: "pending",
+    qr: qrCode
+  })
 
 })
 
-/* enviar mensaje */
+/* endpoint para ver el QR en navegador */
 
-app.post("/messages", async (req, res) => {
+app.get("/qr", (req, res) => {
 
-try {
+  if (!qrCode) {
+    return res.send("QR aun no generado")
+  }
 
-const { to, message } = req.body
-
-await sock.sendMessage(to + "@s.whatsapp.net", {
-text: message
-})
-
-res.json({
-status: "sent"
-})
-
-} catch (error) {
-
-res.status(500).json({
-error: "message failed"
-})
-
-}
-
-})
-
-/* guardar api key openai */
-
-app.post("/settings/openai", (req, res) => {
-
-openaiKey = req.body.key
-
-res.json({
-saved: true
-})
+  res.send(`
+    <h2>Escanea el QR</h2>
+    <img src="${qrCode}" width="300"/>
+  `)
 
 })
 
 app.listen(PORT, () => {
-console.log("Server running on port", PORT)
+  console.log("Server running on port", PORT)
 })
