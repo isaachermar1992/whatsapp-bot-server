@@ -433,7 +433,6 @@ async function startWhatsApp(sessionId) {
       console.log(`[MSG][${sessionId}] messages.upsert tipo:`, type, "cantidad:", msgs.length);
 
       for (const msg of msgs) {
-        if (msg.key.fromMe) continue;
         if (!msg.message) continue;
 
         const msgId = msg.key.id;
@@ -461,10 +460,49 @@ async function startWhatsApp(sessionId) {
 
         if (!text.trim()) continue;
 
-        console.log(`[MSG][${sessionId}] De:`, sender.split("@")[0], "Texto:", text.substring(0, 100));
-
         const senderPhone = sender.split("@")[0];
+        const isFromMe = msg.key.fromMe === true;
+        const textLower = text.trim().toLowerCase();
 
+        console.log(`[MSG][${sessionId}] De:`, senderPhone, "fromMe:", isFromMe, "Texto:", text.substring(0, 100));
+
+        // === KEYWORD COMMANDS ===
+
+        // Client says "asesor" -> disable bot for this contact
+        if (!isFromMe && textLower === "asesor") {
+          console.log(`[CMD][${sessionId}] Cliente ${senderPhone} pidió ASESOR - desactivando bot`);
+          session.disabledContacts.add(senderPhone);
+          saveDisabledContactsToFile();
+          try {
+            await sock.sendMessage(sender, { text: "🧑‍💼 Te estamos conectando con un asesor humano. El bot ha sido desactivado para esta conversación." });
+          } catch (e) {
+            console.error(`[CMD][${sessionId}] Error enviando mensaje de asesor:`, e.message);
+          }
+          continue;
+        }
+
+        // Owner says "bot off" -> disable bot for this contact
+        if (isFromMe && textLower === "bot off") {
+          console.log(`[CMD][${sessionId}] Owner envió BOT OFF para contacto ${senderPhone} - desactivando bot`);
+          session.disabledContacts.add(senderPhone);
+          saveDisabledContactsToFile();
+          console.log(`[CMD][${sessionId}] Bot desactivado para ${senderPhone}. Disabled set:`, Array.from(session.disabledContacts));
+          continue;
+        }
+
+        // Owner says "bot on" -> re-enable bot for this contact
+        if (isFromMe && textLower === "bot on") {
+          console.log(`[CMD][${sessionId}] Owner envió BOT ON para contacto ${senderPhone} - reactivando bot`);
+          session.disabledContacts.delete(senderPhone);
+          saveDisabledContactsToFile();
+          console.log(`[CMD][${sessionId}] Bot reactivado para ${senderPhone}. Disabled set:`, Array.from(session.disabledContacts));
+          continue;
+        }
+
+        // Skip own messages for AI processing
+        if (isFromMe) continue;
+
+        // === DISABLED CHECK ===
         const isDisabledInMemory = session.disabledContacts.has(senderPhone) || session.disabledContacts.has(sender);
         
         let isDisabledInFile = false;
