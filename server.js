@@ -27,6 +27,51 @@ const defaultBotConfig = {
 const sessions = new Map();
 const MAX_RECONNECT = 5;
 const MAX_HISTORY = 20;
+const MAX_QR_ATTEMPTS = 5;
+const DISABLED_CONTACTS_FILE = "./disabled_contacts.json";
+
+function loadDisabledContactsFromFile() {
+  try {
+    if (fs.existsSync(DISABLED_CONTACTS_FILE)) {
+      const data = fs.readFileSync(DISABLED_CONTACTS_FILE, "utf8");
+      const parsed = JSON.parse(data);
+      console.log("[PERSIST] Loaded disabled contacts from file:", JSON.stringify(parsed));
+      return parsed;
+    }
+  } catch (e) {
+    console.error("[PERSIST] Error loading disabled contacts:", e.message);
+  }
+  return {};
+}
+
+function saveDisabledContactsToFile() {
+  try {
+    const allDisabled = {};
+    for (const [sid, session] of sessions.entries()) {
+      if (session.disabledContacts.size > 0) {
+        allDisabled[sid] = Array.from(session.disabledContacts);
+      }
+    }
+    fs.writeFileSync(DISABLED_CONTACTS_FILE, JSON.stringify(allDisabled, null, 2));
+    console.log("[PERSIST] Saved disabled contacts to file:", JSON.stringify(allDisabled));
+  } catch (e) {
+    console.error("[PERSIST] Error saving disabled contacts:", e.message);
+  }
+}
+
+function restoreDisabledContactsForSession(sessionId, session) {
+  try {
+    const allDisabled = loadDisabledContactsFromFile();
+    if (allDisabled[sessionId] && Array.isArray(allDisabled[sessionId])) {
+      for (const phone of allDisabled[sessionId]) {
+        session.disabledContacts.add(phone);
+      }
+      console.log(`[PERSIST][${sessionId}] Restored ${session.disabledContacts.size} disabled contacts from file`);
+    }
+  } catch (e) {
+    console.error(`[PERSIST][${sessionId}] Error restoring disabled contacts:`, e.message);
+  }
+}
 
 function getSession(sessionId) {
   if (!sessionId) sessionId = "default";
@@ -38,11 +83,15 @@ function getSession(sessionId) {
       phoneInfo: null,
       reconnectAttempts: 0,
       isStarting: false,
+      reconnectLocked: false,
+      qrAttempts: 0,
       conversationHistory: new Map(),
       processedMessages: new Set(),
       botConfig: { ...defaultBotConfig },
+      disabledContacts: new Set(),
       authDir: `./auth_info_${sessionId}`,
     });
+    restoreDisabledContactsForSession(sessionId, sessions.get(sessionId));
   }
   return sessions.get(sessionId);
 }
@@ -63,11 +112,38 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const botConfigBackup = new Map();
+
+function backupBotConfig(sessionId, config) {
+  if (config && config.systemPrompt && config.systemPrompt !== defaultBotConfig.systemPrompt) {
+    botConfigBackup.set(sessionId, { ...config });
+    console.log(`[CONFIG][${sessionId}] Bot config backed up (prompt: ${config.systemPrompt.length} chars)`);
+  }
+}
+
+function restoreBotConfig(sessionId, session) {
+  const backup = botConfigBackup.get(sessionId);
+  if (backup && backup.systemPrompt && backup.systemPrompt !== defaultBotConfig.systemPrompt) {
+    if (!session.botConfig.systemPrompt || session.botConfig.systemPrompt === defaultBotConfig.systemPrompt) {
+      session.botConfig = { ...backup };
+      console.log(`[CONFIG][${sessionId}] Bot config restored from backup (prompt: ${backup.systemPrompt.length} chars)`);
+    }
+  }
+}
+
 async function getAIResponse(session, sender, message) {
-  if (!openai.apiKey) {
-    console.log("[BOT] No OpenAI API key configured");
+  const sessionApiKey = session.botConfig.apiKey || null;
+  const globalApiKey = process.env.OPENAI_API_KEY || "";
+  const activeApiKey = sessionApiKey || globalApiKey;
+
+  if (!activeApiKey) {
+    console.log("[BOT] No OpenAI API key configured (neither session nor global)");
     return "Lo siento, el bot no está configurado correctamente. Contacta al administrador.";
   }
+
+  const activeClient = sessionApiKey
+    ? new OpenAI({ apiKey: sessionApiKey })
+    : openai;
 
   try {
     let history = session.conversationHistory.get(sender) || [];
@@ -79,18 +155,28 @@ async function getAIResponse(session, sender, message) {
 
     session.conversationHistory.set(sender, history);
 
+    const systemPrompt = session.botConfig.systemPrompt || defaultBotConfig.systemPrompt;
+
+    if (systemPrompt === defaultBotConfig.systemPrompt) {
+      console.log("[BOT] ⚠️ WARNING: Using DEFAULT prompt, custom prompt may not have been synced!");
+    }
+
     const messages = [
-      { role: "system", content: session.botConfig.systemPrompt },
+      { role: "system", content: systemPrompt },
       ...history,
     ];
 
     console.log("[BOT] Generando respuesta para", sender.split("@")[0]);
+    console.log("[BOT] Modelo:", session.botConfig.model);
+    console.log("[BOT] System prompt (", systemPrompt.length, "chars):", systemPrompt.substring(0, 300) + (systemPrompt.length > 300 ? "..." : ""));
+    console.log("[BOT] Historial:", history.length, "mensajes");
+    console.log("[BOT] Usando API key:", sessionApiKey ? "del bot (custom)" : "global del servidor");
 
-    const completion = await openai.chat.completions.create({
-      model: session.botConfig.model,
+    const completion = await activeClient.chat.completions.create({
+      model: session.botConfig.model || "gpt-4o",
       messages,
-      temperature: session.botConfig.temperature,
-      max_tokens: 500,
+      temperature: session.botConfig.temperature ?? 0.7,
+      max_tokens: 2048,
     });
 
     const reply = completion.choices[0]?.message?.content;
@@ -98,28 +184,68 @@ async function getAIResponse(session, sender, message) {
     if (reply) {
       history.push({ role: "assistant", content: reply });
       session.conversationHistory.set(sender, history);
-      console.log("[BOT] Respuesta generada:", reply.substring(0, 80) + "...");
+      console.log("[BOT] Respuesta generada (", reply.length, "chars):", reply.substring(0, 200));
     } else {
+      console.error("[BOT] OpenAI devolvió respuesta vacía. Choices:", JSON.stringify(completion.choices));
       return "Disculpa, no pude procesar tu mensaje. Intenta de nuevo.";
     }
 
     return reply;
   } catch (error) {
-    console.error("[BOT] Error OpenAI:", error.message);
+    console.error("[BOT] Error OpenAI COMPLETO:", error.message);
+    console.error("[BOT] Error tipo:", error.constructor?.name);
+    console.error("[BOT] Error status:", error.status || "N/A");
+    console.error("[BOT] Error code:", error.code || "N/A");
+    if (error.message?.includes("401") || error.message?.includes("Incorrect API key")) {
+      return "Error: La API key de OpenAI no es válida. Verifica la configuración.";
+    }
+    if (error.message?.includes("429") || error.message?.includes("Rate limit")) {
+      return "El servicio está saturado. Intenta de nuevo en un momento.";
+    }
+    if (error.message?.includes("timeout") || error.message?.includes("ETIMEDOUT")) {
+      return "La respuesta tardó demasiado. Intenta de nuevo.";
+    }
     return "Lo siento, ocurrió un error al procesar tu mensaje. Intenta de nuevo en un momento.";
   }
+}
+
+function destroySocket(session) {
+  if (session.sock) {
+    try { session.sock.ev.removeAllListeners(); } catch (_) {}
+    try { session.sock.ws.close(); } catch (_) {}
+    try { session.sock.end(undefined); } catch (_) {}
+    session.sock = null;
+  }
+}
+
+async function safeReconnect(sessionId, delayMs) {
+  const session = getSession(sessionId);
+  if (session.reconnectLocked) {
+    console.log(`[SERVER][${sessionId}] Reconexion bloqueada (ya hay una en curso)`);
+    return;
+  }
+  session.reconnectLocked = true;
+  destroySocket(session);
+  session.isConnected = false;
+  session.isStarting = false;
+  console.log(`[SERVER][${sessionId}] Esperando ${delayMs}ms antes de reconectar...`);
+  await sleep(delayMs);
+  session.reconnectLocked = false;
+  startWhatsApp(sessionId);
 }
 
 async function startWhatsApp(sessionId) {
   if (!sessionId) sessionId = "default";
   const session = getSession(sessionId);
 
-  if (session.isStarting) {
-    console.log(`[SERVER][${sessionId}] Ya se esta iniciando, ignorando...`);
+  if (session.isStarting || session.reconnectLocked) {
+    console.log(`[SERVER][${sessionId}] Ya se esta iniciando o reconectando, ignorando...`);
     return;
   }
 
   session.isStarting = true;
+
+  destroySocket(session);
 
   try {
     const { version } = await fetchLatestBaileysVersion();
@@ -127,7 +253,7 @@ async function startWhatsApp(sessionId) {
 
     const { state, saveCreds } = await useMultiFileAuthState(session.authDir);
 
-    session.sock = makeWASocket({
+    const sock = makeWASocket({
       auth: state,
       version,
       logger,
@@ -139,13 +265,34 @@ async function startWhatsApp(sessionId) {
       markOnlineOnConnect: false,
     });
 
-    session.sock.ev.on("creds.update", saveCreds);
+    session.sock = sock;
 
-    session.sock.ev.on("connection.update", async (update) => {
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      if (session.sock !== sock) {
+        console.log(`[SERVER][${sessionId}] Evento de socket obsoleto, ignorando`);
+        try { sock.ev.removeAllListeners(); } catch (_) {}
+        try { sock.ws.close(); } catch (_) {}
+        try { sock.end(undefined); } catch (_) {}
+        return;
+      }
+
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log(`[SERVER][${sessionId}] QR recibido - generando imagen...`);
+        session.qrAttempts++;
+        console.log(`[SERVER][${sessionId}] QR recibido (#${session.qrAttempts}/${MAX_QR_ATTEMPTS}) - generando imagen...`);
+
+        if (session.qrAttempts > MAX_QR_ATTEMPTS) {
+          console.log(`[SERVER][${sessionId}] Demasiados QR sin escanear, deteniendo sesion`);
+          destroySocket(session);
+          session.isStarting = false;
+          session.currentQR = null;
+          clearAuthState(session);
+          return;
+        }
+
         try {
           session.currentQR = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
           console.log(`[SERVER][${sessionId}] QR generado OK`);
@@ -159,9 +306,12 @@ async function startWhatsApp(sessionId) {
         session.isConnected = true;
         session.isStarting = false;
         session.currentQR = null;
-        session.phoneInfo = session.sock.user;
+        session.phoneInfo = sock.user;
         session.reconnectAttempts = 0;
+        session.qrAttempts = 0;
+        restoreBotConfig(sessionId, session);
         console.log(`[SERVER][${sessionId}] Usuario:`, session.phoneInfo?.id, session.phoneInfo?.name);
+        console.log(`[SERVER][${sessionId}] Bot config: enabled=${session.botConfig.enabled} prompt=${(session.botConfig.systemPrompt || "").length}chars model=${session.botConfig.model}`);
       }
 
       if (connection === "close") {
@@ -171,57 +321,80 @@ async function startWhatsApp(sessionId) {
         const reason = lastDisconnect?.error?.output?.payload?.message || "unknown";
         console.log(`[SERVER][${sessionId}] Conexion cerrada - codigo:`, code, "razon:", reason);
 
+        if (session.manualDisconnect) {
+          console.log(`[SERVER][${sessionId}] Desconexion manual, NO reconectando`);
+          session.manualDisconnect = false;
+          destroySocket(session);
+          return;
+        }
+
+        if (code === 440) {
+          console.log(`[SERVER][${sessionId}] Conflict detectado - esperando antes de reconectar`);
+          session.reconnectAttempts++;
+          if (session.reconnectAttempts > MAX_RECONNECT) {
+            console.log(`[SERVER][${sessionId}] Demasiados conflictos, limpiando sesion y esperando 5 min`);
+            clearAuthState(session);
+            session.reconnectAttempts = 0;
+            session.phoneInfo = null;
+            await safeReconnect(sessionId, 300000);
+          } else {
+            const delay = Math.min(10000 * Math.pow(2, session.reconnectAttempts - 1), 120000);
+            await safeReconnect(sessionId, delay);
+          }
+          return;
+        }
+
         if (code === DisconnectReason.loggedOut || code === 401) {
           console.log(`[SERVER][${sessionId}] Sesion cerrada por el usuario`);
           clearAuthState(session);
           session.phoneInfo = null;
           session.currentQR = null;
           session.reconnectAttempts = 0;
-          await sleep(5000);
-          startWhatsApp(sessionId);
+          await safeReconnect(sessionId, 5000);
         } else if (code === 405) {
           clearAuthState(session);
           session.phoneInfo = null;
           session.currentQR = null;
           session.reconnectAttempts++;
           const delay = Math.min(15000 + (session.reconnectAttempts * 10000), 120000);
-          await sleep(delay);
-          if (session.reconnectAttempts <= MAX_RECONNECT) {
-            startWhatsApp(sessionId);
-          } else {
-            session.reconnectAttempts = 0;
-            await sleep(300000);
-            startWhatsApp(sessionId);
+          await safeReconnect(sessionId, delay);
+        } else if (code === 428) {
+          console.log(`[SERVER][${sessionId}] QR timeout - sesion no escaneada`);
+          session.qrAttempts++;
+          if (session.qrAttempts > MAX_QR_ATTEMPTS) {
+            console.log(`[SERVER][${sessionId}] Demasiados timeouts QR, deteniendo`);
+            destroySocket(session);
+            session.currentQR = null;
+            clearAuthState(session);
+            return;
           }
+          await safeReconnect(sessionId, 5000);
         } else if (code === 515 || code === 408 || code === 503) {
           session.reconnectAttempts++;
-          const delay = Math.min(5000 * session.reconnectAttempts, 60000);
-          await sleep(delay);
+          const delay = Math.min(10000 * session.reconnectAttempts, 60000);
           if (session.reconnectAttempts <= MAX_RECONNECT) {
-            startWhatsApp(sessionId);
+            await safeReconnect(sessionId, delay);
           } else {
             clearAuthState(session);
             session.reconnectAttempts = 0;
-            await sleep(60000);
-            startWhatsApp(sessionId);
+            await safeReconnect(sessionId, 60000);
           }
         } else {
           session.reconnectAttempts++;
           if (session.reconnectAttempts <= MAX_RECONNECT) {
-            const delay = Math.min(5000 * session.reconnectAttempts, 60000);
-            await sleep(delay);
-            startWhatsApp(sessionId);
+            const delay = Math.min(10000 * session.reconnectAttempts, 60000);
+            await safeReconnect(sessionId, delay);
           } else {
             clearAuthState(session);
             session.reconnectAttempts = 0;
-            await sleep(180000);
-            startWhatsApp(sessionId);
+            await safeReconnect(sessionId, 180000);
           }
         }
       }
     });
 
-    session.sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+    sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+      if (session.sock !== sock) return;
       console.log(`[MSG][${sessionId}] messages.upsert tipo:`, type, "cantidad:", msgs.length);
 
       for (const msg of msgs) {
@@ -255,21 +428,66 @@ async function startWhatsApp(sessionId) {
 
         console.log(`[MSG][${sessionId}] De:`, sender.split("@")[0], "Texto:", text.substring(0, 100));
 
-        if (session.botConfig.enabled && openai.apiKey) {
-          try { await session.sock.readMessages([msg.key]); } catch (_) {}
-          try { await session.sock.sendPresenceUpdate("composing", sender); } catch (_) {}
+        const senderPhone = sender.split("@")[0];
 
-          const reply = await getAIResponse(session, sender, text);
+        const isDisabledInMemory = session.disabledContacts.has(senderPhone) || session.disabledContacts.has(sender);
+        
+        let isDisabledInFile = false;
+        try {
+          const freshDisabled = loadDisabledContactsFromFile();
+          if (freshDisabled[sessionId] && Array.isArray(freshDisabled[sessionId])) {
+            isDisabledInFile = freshDisabled[sessionId].includes(senderPhone);
+            session.disabledContacts = new Set(freshDisabled[sessionId]);
+          }
+        } catch (e) {
+          console.error(`[MSG][${sessionId}] Error reading disabled file:`, e.message);
+        }
 
-          try { await session.sock.sendPresenceUpdate("paused", sender); } catch (_) {}
+        const isDisabled = isDisabledInMemory || isDisabledInFile || session.disabledContacts.has(senderPhone) || session.disabledContacts.has(sender);
+        
+        console.log(`[MSG][${sessionId}] === DISABLED CHECK for ${senderPhone} === inMemory=${isDisabledInMemory} inFile=${isDisabledInFile} final=${isDisabled} setSize=${session.disabledContacts.size} set=${JSON.stringify(Array.from(session.disabledContacts))}`);
+        
+        if (isDisabled) {
+          console.log(`[MSG][${sessionId}] ❌ Bot DESACTIVADO para contacto ${senderPhone}, ignorando mensaje`);
+          continue;
+        }
+        console.log(`[MSG][${sessionId}] ✅ Bot ACTIVO para contacto ${senderPhone}, procesando...`);
 
-          if (reply && session.sock && session.isConnected) {
+        const hasApiKey = session.botConfig.apiKey || openai.apiKey;
+        if (session.botConfig.enabled && hasApiKey) {
+          try { await sock.readMessages([msg.key]); } catch (_) {}
+          try { await sock.sendPresenceUpdate("composing", sender); } catch (_) {}
+
+          console.log(`[MSG][${sessionId}] Bot habilitado, generando respuesta...`);
+
+          let reply = null;
+          try {
+            reply = await getAIResponse(session, sender, text);
+          } catch (aiError) {
+            console.error(`[MSG][${sessionId}] ❌ Error fatal en getAIResponse:`, aiError.message);
+            reply = "Lo siento, ocurrió un error procesando tu mensaje.";
+          }
+
+          try { await sock.sendPresenceUpdate("paused", sender); } catch (_) {}
+
+          if (reply && session.sock === sock && session.isConnected) {
             try {
-              await session.sock.sendMessage(sender, { text: reply });
+              await sock.sendMessage(sender, { text: reply });
               console.log(`[MSG][${sessionId}] ✅ Respuesta enviada a`, sender.split("@")[0]);
             } catch (e) {
               console.error(`[MSG][${sessionId}] ❌ Error enviando:`, e.message);
+              if (session.sock === sock && session.isConnected) {
+                await sleep(3000);
+                try {
+                  await sock.sendMessage(sender, { text: reply });
+                  console.log(`[MSG][${sessionId}] ✅ Reintento exitoso`);
+                } catch (e2) {
+                  console.error(`[MSG][${sessionId}] ❌ Reintento fallido:`, e2.message);
+                }
+              }
             }
+          } else {
+            console.error(`[MSG][${sessionId}] ❌ Socket cambió o desconectado, no se envió respuesta`);
           }
         }
       }
@@ -278,14 +496,12 @@ async function startWhatsApp(sessionId) {
     console.error(`[SERVER][${sessionId}] ERROR FATAL:`, error.message);
     session.isStarting = false;
     session.reconnectAttempts++;
-    const delay = Math.min(15000 * session.reconnectAttempts, 120000);
-    await sleep(delay);
     if (session.reconnectAttempts <= MAX_RECONNECT) {
-      startWhatsApp(sessionId);
+      const delay = Math.min(15000 * session.reconnectAttempts, 120000);
+      await safeReconnect(sessionId, delay);
     } else {
       session.reconnectAttempts = 0;
-      await sleep(300000);
-      startWhatsApp(sessionId);
+      await safeReconnect(sessionId, 300000);
     }
   }
 }
@@ -350,7 +566,8 @@ app.get("/qr", (req, res) => {
     return res.json({ connected: true, qr: null, sessionId });
   }
 
-  if (!session.isStarting && !session.sock) {
+  if (!session.isStarting && !session.sock && !session.reconnectLocked) {
+    session.qrAttempts = 0;
     startWhatsApp(sessionId);
     return res.json({ qr: null, connected: false, sessionId, message: "Iniciando sesión... intenta en unos segundos" });
   }
@@ -399,12 +616,35 @@ app.post("/send", async (req, res) => {
 app.post("/bot/config", (req, res) => {
   const sessionId = getSessionId(req);
   const session = getSession(sessionId);
-  const { enabled, systemPrompt, welcomeMessage, model, temperature } = req.body;
+  const { enabled, systemPrompt, welcomeMessage, model, temperature, apiKey, disabledContacts } = req.body;
   if (typeof enabled === "boolean") session.botConfig.enabled = enabled;
-  if (systemPrompt) session.botConfig.systemPrompt = systemPrompt;
-  if (welcomeMessage) session.botConfig.welcomeMessage = welcomeMessage;
+  if (typeof systemPrompt === "string" && systemPrompt.length > 0) session.botConfig.systemPrompt = systemPrompt;
+  if (typeof welcomeMessage === "string") session.botConfig.welcomeMessage = welcomeMessage;
   if (model) session.botConfig.model = model;
   if (typeof temperature === "number") session.botConfig.temperature = temperature;
+  if (typeof apiKey === "string" && apiKey.trim()) session.botConfig.apiKey = apiKey.trim();
+  if (Array.isArray(disabledContacts)) {
+    const previousContacts = Array.from(session.disabledContacts);
+    session.disabledContacts.clear();
+    for (const phone of disabledContacts) {
+      const cleanPhone = String(phone).replace(/[^0-9]/g, "");
+      if (cleanPhone) {
+        session.disabledContacts.add(cleanPhone);
+      }
+    }
+    saveDisabledContactsToFile();
+    console.log(`[CONFIG][${sessionId}] disabledContacts updated via config: previous=${previousContacts.length} new=${session.disabledContacts.size}`);
+  }
+  backupBotConfig(sessionId, session.botConfig);
+  console.log(`[CONFIG][${sessionId}] Bot config actualizada:`, {
+    enabled: session.botConfig.enabled,
+    model: session.botConfig.model,
+    temperature: session.botConfig.temperature,
+    promptLength: session.botConfig.systemPrompt?.length || 0,
+    promptPreview: (session.botConfig.systemPrompt || "").substring(0, 100),
+    welcomeLength: session.botConfig.welcomeMessage?.length || 0,
+    hasCustomApiKey: !!session.botConfig.apiKey,
+  });
   res.json({ ok: true, config: session.botConfig, sessionId });
 });
 
@@ -414,23 +654,110 @@ app.get("/bot/config", (req, res) => {
   res.json({ ...session.botConfig, sessionId });
 });
 
+app.post("/bot/contact/toggle", (req, res) => {
+  const sessionId = getSessionId(req);
+  const session = getSession(sessionId);
+  const { phone, enabled } = req.body;
+  if (!phone) {
+    return res.status(400).json({ error: "phone requerido" });
+  }
+  const cleanPhone = phone.replace(/[^0-9]/g, "");
+  console.log(`[CONFIG][${sessionId}] Toggle bot for contact: ${cleanPhone} enabled=${enabled} (before: disabled set has ${session.disabledContacts.size} contacts:`, Array.from(session.disabledContacts), ")");
+  if (enabled === false) {
+    session.disabledContacts.add(cleanPhone);
+    console.log(`[CONFIG][${sessionId}] ❌ Bot DESACTIVADO para contacto: ${cleanPhone}`);
+  } else {
+    session.disabledContacts.delete(cleanPhone);
+    console.log(`[CONFIG][${sessionId}] ✅ Bot ACTIVADO para contacto: ${cleanPhone}`);
+  }
+  saveDisabledContactsToFile();
+  console.log(`[CONFIG][${sessionId}] After toggle: disabled set (${session.disabledContacts.size}):`, Array.from(session.disabledContacts));
+  res.json({ ok: true, phone: cleanPhone, botEnabled: enabled !== false, disabledContacts: Array.from(session.disabledContacts), sessionId });
+});
+
+app.post("/bot/contact/disabled/bulk", (req, res) => {
+  const sessionId = getSessionId(req);
+  const session = getSession(sessionId);
+  const { phones } = req.body;
+  if (!Array.isArray(phones)) {
+    return res.status(400).json({ error: "phones array requerido" });
+  }
+  if (phones.length === 0 && session.disabledContacts.size > 0) {
+    console.log(`[CONFIG][${sessionId}] Bulk push with EMPTY array but session has ${session.disabledContacts.size} disabled contacts - IGNORING to prevent accidental clear`);
+    return res.json({ ok: true, disabledContacts: Array.from(session.disabledContacts), sessionId, skipped: true });
+  }
+  const previousContacts = Array.from(session.disabledContacts);
+  session.disabledContacts.clear();
+  for (const phone of phones) {
+    const cleanPhone = String(phone).replace(/[^0-9]/g, "");
+    if (cleanPhone) {
+      session.disabledContacts.add(cleanPhone);
+    }
+  }
+  saveDisabledContactsToFile();
+  console.log(`[CONFIG][${sessionId}] Bulk set disabled contacts: previous=${previousContacts.length} new=${session.disabledContacts.size}`);
+  console.log(`[CONFIG][${sessionId}] Previous:`, previousContacts, "New:", Array.from(session.disabledContacts));
+  res.json({ ok: true, disabledContacts: Array.from(session.disabledContacts), sessionId });
+});
+
+app.get("/bot/contact/disabled", (req, res) => {
+  const sessionId = getSessionId(req);
+  const session = getSession(sessionId);
+  res.json({ disabledContacts: Array.from(session.disabledContacts), sessionId });
+});
+
+app.get("/bot/contact/check", (req, res) => {
+  const sessionId = getSessionId(req);
+  const session = getSession(sessionId);
+  const phone = (req.query.phone || "").replace(/[^0-9]/g, "");
+  if (!phone) {
+    return res.status(400).json({ error: "phone query param required" });
+  }
+  const isDisabledInMemory = session.disabledContacts.has(phone);
+  let isDisabledInFile = false;
+  try {
+    const fileData = loadDisabledContactsFromFile();
+    if (fileData[sessionId] && Array.isArray(fileData[sessionId])) {
+      isDisabledInFile = fileData[sessionId].includes(phone);
+    }
+  } catch (e) {
+    console.error("[CHECK] Error reading file:", e.message);
+  }
+  console.log(`[CHECK][${sessionId}] Phone ${phone}: inMemory=${isDisabledInMemory} inFile=${isDisabledInFile} setSize=${session.disabledContacts.size}`);
+  res.json({ phone, sessionId, isDisabled: isDisabledInMemory || isDisabledInFile, inMemory: isDisabledInMemory, inFile: isDisabledInFile, disabledSet: Array.from(session.disabledContacts) });
+});
+
+app.get("/bot/contact/disabled/all", (req, res) => {
+  const allDisabled = [];
+  for (const [sid, session] of sessions.entries()) {
+    for (const phone of session.disabledContacts) {
+      allDisabled.push({ phone, sessionId: sid });
+    }
+  }
+  res.json({ disabledContacts: allDisabled });
+});
+
 app.post("/disconnect", async (req, res) => {
   const sessionId = getSessionId(req);
   const session = getSession(sessionId);
+  session.manualDisconnect = true;
   try {
     if (session.sock) {
       await session.sock.logout();
     }
   } catch (_) {}
+  destroySocket(session);
   clearAuthState(session);
   session.isConnected = false;
   session.isStarting = false;
+  session.reconnectLocked = false;
   session.phoneInfo = null;
   session.currentQR = null;
+  session.qrAttempts = 0;
+  session.reconnectAttempts = 0;
   session.conversationHistory.clear();
   session.processedMessages.clear();
   res.json({ ok: true, sessionId });
-  setTimeout(() => startWhatsApp(sessionId), 3000);
 });
 
 app.get("/conversations", (req, res) => {
@@ -448,6 +775,7 @@ app.get("/conversations", (req, res) => {
       lastMessageAt: new Date().toISOString(),
       messageCount: history.length,
       sessionId,
+      botDisabled: session.disabledContacts.has(phone),
       messages: history.map((m, i) => ({
         id: `${sender}_${i}`,
         content: m.content,
@@ -476,6 +804,7 @@ app.get("/conversations/all", (req, res) => {
         lastMessageAt: new Date().toISOString(),
         messageCount: history.length,
         sessionId,
+        botDisabled: session.disabledContacts.has(phone),
         messages: history.map((m, i) => ({
           id: `${sender}_${i}`,
           content: m.content,
@@ -531,17 +860,15 @@ app.get("/logs", (req, res) => {
 app.post("/restart", async (req, res) => {
   const sessionId = getSessionId(req);
   const session = getSession(sessionId);
-  try {
-    if (session.sock) {
-      session.sock.end(undefined);
-    }
-  } catch (_) {}
+  destroySocket(session);
   clearAuthState(session);
   session.isConnected = false;
   session.isStarting = false;
+  session.reconnectLocked = false;
   session.phoneInfo = null;
   session.currentQR = null;
   session.reconnectAttempts = 0;
+  session.qrAttempts = 0;
   session.conversationHistory.clear();
   session.processedMessages.clear();
   res.json({ ok: true, sessionId, message: "Reiniciando..." });
@@ -560,6 +887,7 @@ app.delete("/session/:sessionId", async (req, res) => {
       await session.sock.logout();
     }
   } catch (_) {}
+  destroySocket(session);
   clearAuthState(session);
   sessions.delete(sessionId);
   res.json({ ok: true, sessionId, message: "Sesión eliminada" });
