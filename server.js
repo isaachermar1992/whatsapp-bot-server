@@ -28,6 +28,8 @@ const defaultBotConfig = {
 
 const sessions = new Map();
 const MAX_RECONNECT = 5;
+const MAX_NETWORK_RECONNECT = 15;
+const FALLBACK_WA_VERSION = [2, 3000, 1015901307];
 const MAX_HISTORY = 20;
 const MAX_QR_ATTEMPTS = 5;
 const DISABLED_CONTACTS_FILE = "./disabled_contacts.json";
@@ -283,8 +285,15 @@ async function startWhatsApp(sessionId) {
   destroySocket(session);
 
   try {
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`[SERVER][${sessionId}] WA version:`, version.join("."));
+    let version;
+    try {
+      const fetched = await fetchLatestBaileysVersion();
+      version = fetched.version;
+      console.log(`[SERVER][${sessionId}] WA version (fetched):`, version.join("."));
+    } catch (vErr) {
+      version = FALLBACK_WA_VERSION;
+      console.log(`[SERVER][${sessionId}] WA version fetch failed (${vErr.message}), using fallback:`, version.join("."));
+    }
 
     const { state, saveCreds } = await useMultiFileAuthState(session.authDir);
 
@@ -292,12 +301,13 @@ async function startWhatsApp(sessionId) {
       auth: state,
       version,
       logger,
-      browser: [`WA Bot ${sessionId}`, "Chrome", "22.0"],
-      connectTimeoutMs: 60000,
-      qrTimeout: 40000,
-      defaultQueryTimeoutMs: 60000,
-      retryRequestDelayMs: 500,
+      browser: ["Chrome", "Chrome", "22.0"],
+      connectTimeoutMs: 90000,
+      qrTimeout: 60000,
+      defaultQueryTimeoutMs: 90000,
+      retryRequestDelayMs: 1000,
       markOnlineOnConnect: false,
+      keepAliveIntervalMs: 25000,
     });
 
     session.sock = sock;
@@ -409,7 +419,18 @@ async function startWhatsApp(sessionId) {
             return;
           }
           await safeReconnect(sessionId, 5000);
-        } else if (code === 515 || code === 408 || code === 503) {
+        } else if (code === 408) {
+          session.reconnectAttempts++;
+          console.log(`[SERVER][${sessionId}] Error de red (408) - intento ${session.reconnectAttempts}/${MAX_NETWORK_RECONNECT} (NO se borra auth)`);
+          if (session.reconnectAttempts <= MAX_NETWORK_RECONNECT) {
+            const delay = Math.min(15000 * session.reconnectAttempts, 180000);
+            await safeReconnect(sessionId, delay);
+          } else {
+            console.log(`[SERVER][${sessionId}] Demasiados errores de red, pausando 5 minutos antes de reintentar`);
+            session.reconnectAttempts = 0;
+            await safeReconnect(sessionId, 300000);
+          }
+      } else if (code === 515 || code === 503) {
           session.reconnectAttempts++;
           const delay = Math.min(10000 * session.reconnectAttempts, 60000);
           if (session.reconnectAttempts <= MAX_RECONNECT) {
