@@ -27,11 +27,14 @@ const defaultBotConfig = {
 };
 
 const sessions = new Map();
+const MAX_SESSIONS = 20;
 const MAX_RECONNECT = 5;
 const MAX_NETWORK_RECONNECT = 15;
 const FALLBACK_WA_VERSION = [2, 3000, 1015901307];
-const MAX_HISTORY = 20;
+const MAX_HISTORY = 15;
 const MAX_QR_ATTEMPTS = 5;
+const MAX_PROCESSED_MESSAGES = 500;
+const CLEANUP_THRESHOLD = 300;
 const DISABLED_CONTACTS_FILE = "./disabled_contacts.json";
 
 function loadDisabledContactsFromFile() {
@@ -465,9 +468,9 @@ async function startWhatsApp(sessionId) {
         if (session.processedMessages.has(msgId)) continue;
         session.processedMessages.add(msgId);
 
-        if (session.processedMessages.size > 1000) {
+        if (session.processedMessages.size > MAX_PROCESSED_MESSAGES) {
           const entries = Array.from(session.processedMessages);
-          entries.slice(0, 500).forEach((id) => session.processedMessages.delete(id));
+          entries.slice(0, CLEANUP_THRESHOLD).forEach((id) => session.processedMessages.delete(id));
         }
 
         const sender = msg.key.remoteJid;
@@ -626,6 +629,7 @@ app.get("/", (req, res) => {
     hasOpenAI: !!openai.apiKey,
     sessions: sessionList,
     totalSessions: sessions.size,
+    maxSessions: MAX_SESSIONS,
   });
 });
 
@@ -642,7 +646,7 @@ app.get("/sessions", (req, res) => {
       activeConversations: s.conversationHistory.size,
     });
   }
-  res.json({ sessions: sessionList, total: sessionList.length });
+  res.json({ sessions: sessionList, total: sessionList.length, maxSessions: MAX_SESSIONS });
 });
 
 app.post("/session/create", async (req, res) => {
@@ -650,11 +654,14 @@ app.post("/session/create", async (req, res) => {
   if (!sessionId) {
     return res.status(400).json({ error: "sessionId requerido" });
   }
+  if (!sessions.has(sessionId) && sessions.size >= MAX_SESSIONS) {
+    return res.status(429).json({ error: `Límite de ${MAX_SESSIONS} sesiones simultáneas alcanzado. Elimina una sesión antes de crear otra.`, maxSessions: MAX_SESSIONS, currentSessions: sessions.size });
+  }
   const session = getSession(sessionId);
   if (!session.isConnected && !session.isStarting) {
     startWhatsApp(sessionId);
   }
-  res.json({ ok: true, sessionId });
+  res.json({ ok: true, sessionId, currentSessions: sessions.size, maxSessions: MAX_SESSIONS });
 });
 
 app.get("/qr", (req, res) => {
@@ -996,6 +1003,23 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log("[SERVER] Corriendo en puerto", PORT);
   console.log("[SERVER] OpenAI API key:", openai.apiKey ? "configurada ✅" : "NO configurada ❌");
-  console.log("[SERVER] Multi-session mode enabled");
+  console.log(`[SERVER] Multi-session mode enabled (max ${MAX_SESSIONS} sessions)`);
+  console.log(`[SERVER] Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB used`);
   startWhatsApp("default");
+
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    console.log(`[SERVER] Memory: heap=${Math.round(mem.heapUsed / 1024 / 1024)}MB rss=${Math.round(mem.rss / 1024 / 1024)}MB sessions=${sessions.size}/${MAX_SESSIONS}`);
+    for (const [sid, s] of sessions.entries()) {
+      if (s.conversationHistory.size > 50) {
+        const entries = Array.from(s.conversationHistory.entries());
+        entries.sort((a, b) => a[1].length - b[1].length);
+        const toRemove = entries.slice(0, entries.length - 50);
+        for (const [key] of toRemove) {
+          s.conversationHistory.delete(key);
+        }
+        console.log(`[SERVER][${sid}] Trimmed ${toRemove.length} old conversations`);
+      }
+    }
+  }, 300000);
 });
