@@ -14,6 +14,8 @@ const logger = pino({ level: "silent" });
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "",
+  timeout: 30000,
+  maxRetries: 0,
 });
 
 const defaultBotConfig = {
@@ -131,6 +133,35 @@ function restoreBotConfig(sessionId, session) {
   }
 }
 
+async function callOpenAIWithRetry(activeClient, params, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const completion = await activeClient.chat.completions.create(
+        params,
+        { signal: controller.signal }
+      );
+      clearTimeout(timeoutId);
+      return completion;
+    } catch (error) {
+      const isAbort = error.name === "AbortError" || error.message?.includes("aborted") || error.message?.includes("abort");
+      const isTimeout = error.message?.includes("timeout") || error.message?.includes("ETIMEDOUT") || error.code === "ETIMEDOUT";
+      const isRetryable = isAbort || isTimeout || error.status === 500 || error.status === 502 || error.status === 503 || error.status === 429;
+      
+      console.error(`[BOT] OpenAI attempt ${attempt + 1}/${maxRetries + 1} failed:`, error.message, "retryable:", isRetryable);
+      
+      if (!isRetryable || attempt === maxRetries) {
+        throw error;
+      }
+      
+      const delay = (attempt + 1) * 2000;
+      console.log(`[BOT] Reintentando en ${delay}ms...`);
+      await sleep(delay);
+    }
+  }
+}
+
 async function getAIResponse(session, sender, message) {
   const sessionApiKey = session.botConfig.apiKey || null;
   const globalApiKey = process.env.OPENAI_API_KEY || "";
@@ -142,7 +173,7 @@ async function getAIResponse(session, sender, message) {
   }
 
   const activeClient = sessionApiKey
-    ? new OpenAI({ apiKey: sessionApiKey })
+    ? new OpenAI({ apiKey: sessionApiKey, timeout: 30000, maxRetries: 0 })
     : openai;
 
   try {
@@ -172,7 +203,7 @@ async function getAIResponse(session, sender, message) {
     console.log("[BOT] Historial:", history.length, "mensajes");
     console.log("[BOT] Usando API key:", sessionApiKey ? "del bot (custom)" : "global del servidor");
 
-    const completion = await activeClient.chat.completions.create({
+    const completion = await callOpenAIWithRetry(activeClient, {
       model: session.botConfig.model || "gpt-4o",
       messages,
       temperature: session.botConfig.temperature ?? 0.7,
@@ -201,6 +232,10 @@ async function getAIResponse(session, sender, message) {
     }
     if (error.message?.includes("429") || error.message?.includes("Rate limit")) {
       return "El servicio está saturado. Intenta de nuevo en un momento.";
+    }
+    if (error.name === "AbortError" || error.message?.includes("aborted") || error.message?.includes("abort")) {
+      console.error("[BOT] ⚠️ Request fue abortado/timeout después de reintentos");
+      return "La respuesta tardó demasiado. Intenta de nuevo en un momento.";
     }
     if (error.message?.includes("timeout") || error.message?.includes("ETIMEDOUT")) {
       return "La respuesta tardó demasiado. Intenta de nuevo.";
