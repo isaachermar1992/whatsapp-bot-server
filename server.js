@@ -323,7 +323,9 @@ async function startWhatsApp(sessionId) {
           console.log(`[SERVER][${sessionId}] Demasiados QR sin escanear, deteniendo sesion`);
           destroySocket(session);
           session.isStarting = false;
+          session.reconnectLocked = false;
           session.currentQR = null;
+          session.qrAttempts = 0;
           clearAuthState(session);
           return;
         }
@@ -399,7 +401,10 @@ async function startWhatsApp(sessionId) {
           if (session.qrAttempts > MAX_QR_ATTEMPTS) {
             console.log(`[SERVER][${sessionId}] Demasiados timeouts QR, deteniendo`);
             destroySocket(session);
+            session.isStarting = false;
+            session.reconnectLocked = false;
             session.currentQR = null;
+            session.qrAttempts = 0;
             clearAuthState(session);
             return;
           }
